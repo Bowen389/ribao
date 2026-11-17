@@ -1,8 +1,10 @@
 import argparse
+import gzip
+import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 import socket
-from time import monotonic
+from time import monotonic, sleep
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -120,28 +122,56 @@ def simulate(frames, sessions, mode, count, start_i, end_i):
 def fetch_shard(shard, codes, start, asof):
     socket.setdefaulttimeout(20)
     started = monotonic()
-    login = bs.login()
-    if login.error_code != "0":
-        raise RuntimeError(f"分片 {shard} 登录失败: {login.error_msg}")
+    cache = Path(".ribao-cache") / asof
+    cache.mkdir(parents=True, exist_ok=True)
+    connected = False
     try:
         frames, failed = {}, []
         for position, code in enumerate(codes, 1):
-            for attempt in range(2):
+            target = cache / f"{code}.json.gz"
+            for attempt in range(3):
                 try:
-                    raw = read(bs.query_history_k_data_plus(code, FIELDS, start, asof, "d", "3"))
-                    adj = read(bs.query_history_k_data_plus(code, "date,close,high,low", start, asof, "d", "2"))
+                    if target.is_file():
+                        with gzip.open(target, "rt", encoding="utf-8") as fd:
+                            records = json.load(fd)
+                        raw, adj = (pd.DataFrame(**record) for record in records)
+                    else:
+                        if not connected:
+                            login = bs.login()
+                            if login.error_code != "0":
+                                raise RuntimeError(f"登录失败: {login.error_msg}")
+                            connected = True
+                        raw = read(bs.query_history_k_data_plus(code, FIELDS, start, asof, "d", "3"))
+                        adj = read(bs.query_history_k_data_plus(code, "date,close,high,low", start, asof, "d", "2"))
                     if raw.empty or adj.empty or raw.date.iloc[-1] != asof or adj.date.iloc[-1] != asof:
-                        raise RuntimeError("当日日线未齐")
-                    frames[code] = features(raw, adj)
+                        raise ValueError("当日日线未齐")
+                    frame = features(raw, adj)
+                    if not target.exists():
+                        temporary = target.with_suffix(".tmp")
+                        with gzip.open(temporary, "wt", encoding="utf-8") as fd:
+                            json.dump([x.to_dict(orient="split", index=False) for x in (raw, adj)], fd)
+                        temporary.replace(target)
+                    frames[code] = frame
                     break
-                except (RuntimeError, ValueError, OSError) as exc:
-                    if attempt:
+                except (RuntimeError, ValueError, OSError, TypeError, KeyError) as exc:
+                    if target.exists():
+                        target.unlink()
+                    if isinstance(exc, (RuntimeError, OSError)):
+                        if connected:
+                            bs.logout()
+                        connected = False
+                    if attempt == 2:
                         failed.append((code, str(exc)))
+                        if len(failed) <= 5:
+                            print(f"分片 {shard} {code}: {exc}", flush=True)
+                    else:
+                        sleep(1 << attempt)
             if position % 25 == 0 or position == len(codes):
                 print(f'分片 {shard}: {position}/{len(codes)}，成功 {len(frames)}，失败 {len(failed)}，耗时 {monotonic()-started:.0f}s', flush=True)
         return frames, failed
     finally:
-        bs.logout()
+        if connected:
+            bs.logout()
 
 
 def run(asof):
@@ -159,12 +189,16 @@ def run(asof):
     if len(codes) < 2000:
         raise RuntimeError(f"主板日股票池仅 {len(codes)} 只，拒绝使用不完整快照")
     frames, failed = {}, []
-    chunks = [sorted(codes)[offset::8] for offset in range(8)]
-    print(f"{asof} 主板股票池 {len(codes)} 只，启动 8 个独立行情连接", flush=True)
-    with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as pool:
+    chunks = [sorted(codes)[offset::2] for offset in range(2)]
+    print(f"{asof} 主板股票池 {len(codes)} 只，启动 2 个独立行情连接", flush=True)
+    with ProcessPoolExecutor(max_workers=2, mp_context=get_context("spawn")) as pool:
         futures = [pool.submit(fetch_shard, shard, chunk, start, asof) for shard, chunk in enumerate(chunks, 1)]
         for future in as_completed(futures):
-            batch, errors = future.result()
+            try:
+                batch, errors = future.result()
+            except Exception as exc:
+                print(f'分片异常：{exc}', flush=True)
+                continue
             frames.update(batch)
             failed.extend(errors)
     frames = dict(sorted(frames.items()))
