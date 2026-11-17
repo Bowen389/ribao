@@ -1,5 +1,8 @@
 name: 18点独立盘后日报
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/daily.yml']
   schedule:
     - cron: '0 10 * * 1-5'
   workflow_dispatch:
@@ -11,7 +14,7 @@ permissions:
   contents: write
 concurrency:
   group: ribao-main
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   report:
     runs-on: ubuntu-latest
@@ -27,9 +30,9 @@ jobs:
           REQUEST_DATE: ${{ inputs.date }}
         run: |
           if [ -n "$REQUEST_DATE" ]; then
-            python daily.py --date "$REQUEST_DATE"
+            python -u daily.py --date "$REQUEST_DATE"
           else
-            python daily.py
+            python -u daily.py
           fi
       - name: 发布日报
         run: |
