@@ -1,8 +1,5 @@
 name: 18点独立盘后日报
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/daily.yml']
   schedule:
     - cron: '0 10 * * 1-5'
   workflow_dispatch:
