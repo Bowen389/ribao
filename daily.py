@@ -16,7 +16,10 @@ MAIN = ("sh.600", "sh.601", "sh.603", "sh.605", "sz.000", "sz.001", "sz.002", "s
 def read(result):
     if result.error_code != "0":
         raise RuntimeError(f"BaoStock {result.error_code}: {result.error_msg}")
-    frame = result.get_data()
+    rows = []
+    while result.next():
+        rows.append(result.get_row_data())
+    frame = pd.DataFrame(rows, columns=result.fields)
     if result.error_code != "0":
         raise RuntimeError(f"BaoStock {result.error_code}: {result.error_msg}")
     return frame
