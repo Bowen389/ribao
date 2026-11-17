@@ -168,9 +168,36 @@ def compare(frames, sessions, book):
     start = max(1, len(sessions) - 252)
     cut = (start + len(sessions)) // 2
 
+    # Only observations that have already reached their exit date inform rankings.
+    observations = {}
+    for i in range(1, len(sessions) - 1):
+        signal, buy = sessions[i - 1:i + 1]
+        for code, routes in book.get(signal, {}).items():
+            x = frames[code]
+            if buy not in x.index:
+                continue
+            entry = x.loc[buy]
+            if entry.open_up or entry.gap <= -.095 or entry.isST != "0":
+                continue
+            for route in matching(routes, entry):
+                j = i + (2 if route == "07" else 1)
+                if j >= len(sessions) or sessions[j] not in x.index:
+                    continue
+                exit_row = x.loc[sessions[j]]
+                price = exit_row.open if route in {"15", "16"} and entry.up else exit_row.close
+                if price <= 0 or exit_row.chg <= -.095:
+                    continue
+                result = price * (exit_row.adj / exit_row.close) / (entry.open * entry.adj / entry.close) - 1 - .004
+                observations.setdefault(j, []).append((route, result))
+
     def run(left, right, ordering, capacity):
         cash, positions, nav, fills = 60_000., {}, [60_000.], 0
-        for i in range(left, right):
+        history = {}
+        for i in range(max(1, left - 60), right):
+            for route, result in observations.get(i - 1, ()):
+                history.setdefault(route, []).append((i - 1, result))
+            if i < left:
+                continue
             day, yesterday = sessions[i], sessions[i - 1]
             orders = []
             for code, routes in book.get(yesterday, {}).items():
@@ -179,15 +206,34 @@ def compare(frames, sessions, book):
                 r = frames[code].loc[day]
                 if r.open_up or r.gap <= -.095 or r.isST != "0":
                     continue
-                matched = matching({k: v for k, v in routes.items() if k not in OPPORTUNITY}, r)
+                matched = matching(routes, r)
                 if not matched:
                     continue
+                def evidence(route):
+                    sample = [v for j, v in history.get(route, ()) if j >= i - 60]
+                    return sum(sample) / (len(sample) + 20)
+                if ordering == "常规首笔＋机会竞争":
+                    route = max(matched, key=lambda k: (evidence(k), k not in OPPORTUNITY, k))
+                    regular = [k for k in matched if k not in OPPORTUNITY]
+                    regular_route = max(regular, key=lambda k: (evidence(k), k), default=None)
+                else:
+                    regular_route = None
+                    route = max(matched, key=lambda k: (evidence(k), k))
                 overlaps = len({FAMILY.get(k, k) for k in matched})
-                key = {"多家族优先": (-overlaps, r.gap), "深低开优先": (r.gap, -overlaps),
-                       "历史排名优先": (min(int(k) for k in matched), -overlaps)}[ordering]
-                orders.append((key, code, r))
+                key = ((-overlaps, -evidence(route), r.gap) if ordering == "多家族优先"
+                       else (-evidence(route), -overlaps, r.gap))
+                orders.append((key, code, r, route, regular_route))
             opened = 0
-            for _, code, r in sorted(orders, key=lambda t: (t[0], t[1])):
+            while orders:
+                first_regular = ordering == "常规首笔＋机会竞争" and opened == 0
+                available = [o for o in orders if not first_regular or o[4] is not None]
+                if not available:
+                    break
+                pick = min(available, key=lambda o: ((-evidence(o[4]), o[0]) if first_regular else (o[0],), o[1]))
+                orders.remove(pick)
+                _, code, r, route, regular_route = pick
+                if first_regular:
+                    route = regular_route
                 if len(positions) >= 6 or opened >= capacity:
                     break
                 price = r.open * 1.001
@@ -196,7 +242,7 @@ def compare(frames, sessions, book):
                     continue
                 gross = qty * price
                 cash -= gross + max(5., gross * .0003)
-                positions[code] = [qty, r.adj / r.close, price, i + 1]
+                positions[code] = [qty, r.adj / r.close, price, i + (2 if route == "07" else 1), route, 0, route in {"15", "16"} and r.up]
                 opened += 1
                 fills += 1
             for code, pos in list(positions.items()):
@@ -204,20 +250,30 @@ def compare(frames, sessions, book):
                     continue
                 r = frames[code].loc[day]
                 pos[2] = r.adj / pos[1]
-                if i >= pos[3] and r.close > np.floor(r.preclose * 90 + .500001) / 100 + .00001:
-                    gross = pos[0] * pos[2] * .999
-                    cash += gross - max(5., gross * .0003) - gross * .0005
-                    del positions[code]
+                if i < pos[3]:
+                    continue
+                use_open = pos[6] and r.open > np.floor(r.preclose * 90 + .500001) / 100 + .00001
+                if pos[6] and not use_open:
+                    continue
+                if not use_open and r.close <= np.floor(r.preclose * 90 + .500001) / 100 + .00001:
+                    continue
+                if not use_open and r.up and (pos[4] == "06" or (pos[4] in {"01", "02", "03", "14"} and pos[5] < 3)):
+                    pos[5] += 1
+                    continue
+                exit_value = r.open * r.adj / r.close / pos[1] if use_open else pos[2]
+                gross = pos[0] * exit_value * .999
+                cash += gross - max(5., gross * .0003) - gross * .0005
+                del positions[code]
             nav.append(cash + sum(p[0] * p[2] for p in positions.values()))
         x = np.asarray(nav)
         ret = x[1:] / x[:-1] - 1
         std = ret.std(ddof=1)
         return (float((x[-1] / x[0]) ** (252 / len(ret)) - 1),
                 float(max(1 - x / np.maximum.accumulate(x))),
-                float(ret.mean() / std * np.sqrt(252)) if std > 0 else 0., fills)
+                float(ret.mean() / std * np.sqrt(252)) if std > 0 else 0., fills, float(x[-1] - x[0]))
 
     rows = [(rule, cap, run(start, cut, rule, cap), run(cut, len(sessions), rule, cap))
-            for rule in ("多家族优先", "深低开优先", "历史排名优先") for cap in (1, 2)]
+            for rule in ("滚动路线优先", "多家族优先", "常规首笔＋机会竞争") for cap in (1, 2)]
     valid = [row for row in rows if row[2][1] <= .15 and row[2][3] >= 15 and row[2][2] > 0]
     return rows, max(valid, key=lambda row: (row[2][2], row[2][0]), default=None), sessions[start], sessions[cut]
 
@@ -230,13 +286,16 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
     book = build_book(frames, sessions, sh, small)
     rows, choice, begin, cut = compare(frames, sessions, book)
     out = ["", "### 跨策略共用资金对照", "",
-           f"观察期自 {begin} 起，{cut} 起为独立留出段。每段 6 万起步、每笔最多 1 万、最多 6 仓。统一买入后下一交易日收盘卖，跌停顺延。该统一卖点用于比较买入排序，与个别策略原卖点不同。",
-           "同股只成交一次，BF 变体和四象限变体分别合并计一个家族。开发段以回撤≤15%、开仓≥15、夏普为正筛选，再按夏普排序。",
+           f"观察期自 {begin} 起，{cut} 起为独立留出段。每段 6 万起步、每笔最多 1 万、最多 6 仓。按路线处理卖点：07 多持一天，06/BF 封板续持，15/16 封板后次日开盘退出。其余按下一交易日收盘代理。",
+           "滚动分为过去60个交易日可得的事件净收益之和除以（样本数＋20），缺样本记0。第二笔增益按同方案两笔减一笔计算。","同股只成交一次，BF 变体和四象限变体分别合并计一个家族。开发段以回撤≤15%、开仓≥15、夏普为正筛选，再按夏普排序。",
            "回测股票来自报告日可取股票池，存在幸存者偏差；重建规则的原历史夏普不能直接沿用。", "",
-           "|方法|每日上限|开发 年化／回撤／夏普／笔数|留出 年化／回撤／夏普／笔数|",
+           "|方法|每日上限|开发 年化／回撤／夏普／笔数／净利|留出 年化／回撤／夏普／笔数／净利|",
            "|---|---:|---|---|"]
-    metric = lambda x: f"{x[0]:.2%}／{x[1]:.2%}／{x[2]:.2f}／{x[3]}"
+    metric = lambda x: f"{x[0]:.2%}／{x[1]:.2%}／{x[2]:.2f}／{x[3]}／¥{x[4]:,.0f}"
     out.extend(f"|{r}|{n}|{metric(a)}|{metric(b)}|" for r,n,a,b in rows)
+    out.extend(["", "第二笔带来的留出段净利变化（双笔方案减单笔方案）："])
+    for one, two in zip(rows[::2], rows[1::2]):
+        out.append(f"- {one[0]}：¥{two[3][4] - one[3][4]:+,.0f}")
     out.extend(["", (f"开发段首选：{choice[0]}，每日最多 {choice[1]} 笔。留出段结果见表。"
                      if choice else "暂无通过开发门槛的综合方案。"), ""])
     opportunity = ["", "盘后预选须等次日真实开盘确认。默认每笔最多 1 万、整手，买入后下一交易日收盘退出；16 按封板状态决定下一交易日开盘或收盘卖。", ""]
