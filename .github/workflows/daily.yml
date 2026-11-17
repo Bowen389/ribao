@@ -1,0 +1,43 @@
+name: 18点独立盘后日报
+on:
+  schedule:
+    - cron: '0 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '北京时间历史交易日 YYYY-MM-DD，留空为当天'
+        required: false
+permissions:
+  contents: write
+concurrency:
+  group: ribao-main
+  cancel-in-progress: false
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install baostock pandas numpy
+      - name: 独立取数与扫描
+        env:
+          REQUEST_DATE: ${{ inputs.date }}
+        run: |
+          if [ -n "$REQUEST_DATE" ]; then
+            python daily.py --date "$REQUEST_DATE"
+          else
+            python daily.py
+          fi
+      - name: 发布日报
+        run: |
+          if [ ! -d reports ]; then exit 0; fi
+          git add reports/
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Publish after-close report'
+          git pull --rebase
+          git push
