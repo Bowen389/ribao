@@ -7,8 +7,8 @@ import baostock as bs
 import numpy as np
 import pandas as pd
 
-FIELDS = "date,code,open,high,close,preclose,amount,tradestatus,isST,adjustflag"
-PENDING = "01–03 BF组合、06 最低缺口、08–09/13 四象限、11 H1、14 G3、15 2j3、17 BA、20 主力捉妖"
+FIELDS = "date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,isST,adjustflag"
+PENDING = "01–03 BF组合、08–09/13 四象限、11 H1、14 G3、17 BA"
 MAIN = ("sh.600", "sh.601", "sh.603", "sh.605", "sz.000", "sz.001", "sz.002", "sz.003")
 
 
@@ -22,8 +22,8 @@ def read(result):
 
 
 def features(raw, adjusted):
-    x = raw.merge(adjusted[["date", "close"]].rename(columns={"close": "adj"}), on="date", validate="1:1")
-    for key in ["open", "high", "close", "preclose", "amount", "adj"]:
+    x = raw.merge(adjusted[["date", "close", "high", "low"]].rename(columns={"close": "adj", "high": "adj_high", "low": "adj_low"}), on="date", validate="1:1")
+    for key in ["open", "high", "low", "close", "preclose", "volume", "amount", "turn", "adj", "adj_high", "adj_low"]:
         x[key] = pd.to_numeric(x[key], errors="coerce")
     x = x[(x.tradestatus == "1") & (x.open > 0) & (x.preclose > 0)].copy()
     x["gap"] = x.open / x.preclose - 1
@@ -37,6 +37,18 @@ def features(raw, adjusted):
     x["leader"] = eligible & (x.strength > .15) & (x.chg < -.045) & (x.relative_amount > 1.5)
     up = x.up & (x.isST == "0")
     x["four_board"] = eligible & up & up.shift().rolling(3).sum().eq(3) & up.shift(4).eq(False)
+    x["first_board"] = up & up.shift().eq(False)
+    x["float_cap"] = x.close * x.volume / (x.turn.where(x.turn > 0) / 100)
+    age = (pd.to_datetime(x.date) - pd.Timestamp(x.date.iloc[0])).dt.days if len(x) else pd.Series(dtype=int)
+    amplitude = x.adj_high.rolling(5).max() / x.adj_low.rolling(5).min() - 1
+    x["min_gap"] = x.first_board & age.ge(50) & x.amount.between(3e8, 19e8) & amplitude.le(.20) & x.float_cap.between(1e9, 20e9)
+    high, low = x.adj_high.rolling(10).max(), x.adj_low.rolling(10).min()
+    span = (high - low).where(high > low)
+    red = (200 * (x.adj - low) / span - 105).ewm(alpha=.2, adjust=False).mean() + 15
+    green = (200 * (high - x.adj) / span - 125).ewm(alpha=.2, adjust=False).mean() + 15
+    x["zhuoyao"] = ((x.isST == "0") & span.notna() & span.shift().notna()
+                    & red.gt(green) & red.shift().le(green.shift()) & x.float_cap.lt(7.5e9)
+                    & x.turn.ge(5) & x.turn.lt(15) & x.volume.ge(3e7) & x.volume.lt(8e7))
     return x.set_index("date")
 
 
@@ -97,6 +109,52 @@ def simulate(frames, sessions, mode, count, start_i, end_i):
     )
 
 
+def route_sections(frames, codes, asof, start):
+    rows = [(code, x.loc[asof]) for code, x in frames.items() if asof in x.index]
+
+    def section(title, instructions, picks):
+        body = ["", f"### {title}", "", instructions, "",
+                "|代码|名称|收盘参考|成交额（亿元）|换手率|", "|---|---|---:|---:|---:|"]
+        body.extend(f"|{code}|{codes[code]}|{row.close:.2f}|{row.amount / 1e8:.2f}|{row.turn:.2f}%|"
+                    for code, row in sorted(picks, key=lambda item: item[0]))
+        if not picks:
+            body.extend(["", "已覆盖样本中零盘后候选。"])
+        return body
+
+    out = section("06 首板最低缺口 Top1",
+                  "次日开盘缺口 0%～6%，优先最低缺口，同缺口按信号日成交额降序、代码升序。原回测最多三仓、每笔约权益三分之一；买入后次日收盘首次评估，封板续持。流通市值使用成交额字段外的量价换手估计。",
+                  [(code, r) for code, r in rows if r.min_gap])
+    out += section("20-A 主力捉妖 Top2",
+                   "次日先选 [-2%, -1%)，再用 [0%, +3%) 补足，同档从低到高、代码升序。最多两只、四仓、单笔权益 25%，买入后下一交易日收盘退出，停牌或收盘跌停顺延。",
+                   [(code, r) for code, r in rows if r.zhuoyao])
+    try:
+        index = read(bs.query_history_k_data_plus("sh.000852", "date,close", start, asof, "d", "3"))
+        closes = pd.to_numeric(index.close, errors="coerce").dropna()
+        if len(closes) < 11 or index.date.iloc[-1] != asof:
+            raise RuntimeError("中证1000 当日指数缺失")
+        ma = closes.rolling(10).mean()
+        rising = ma.iloc[-1] > ma.iloc[-2]
+        falling = ma.iloc[-1] < ma.iloc[-2]
+        ratio = closes.iloc[-1] / ma.iloc[-1]
+        strategy15 = (falling and ratio <= .98) or (rising and ratio < 1)
+        strategy16 = rising and ratio > 1
+        instructions = "次日高开 2%～5%（含端点），按高开幅度降序、代码升序，最多两只、每只约 1 万元。买入日封板则下一交易日开盘卖，否则下一交易日收盘卖。"
+        pool = [(code, r) for code, r in rows if r.first_board and 3 <= r.close < 5]
+        for title, active, picks, dest in (
+            ("15 2j3 原版", strategy15, pool, out),
+            ("16 2j3 强市补充", strategy16, [(c, r) for c, r in pool if 3e8 <= r.amount < 6e8 and r.turn >= 6], None),
+        ):
+            block = section(title, instructions, picks) if active else ["", f"### {title}", "", "中证1000 市场门控关闭。"]
+            if dest is not None:
+                dest.extend(block)
+            else:
+                opportunity = block
+    except (RuntimeError, ValueError, OSError) as exc:
+        out.extend(["", "### 15 2j3 原版", "", f"数据待核验：{exc}"])
+        opportunity = ["", "### 16 2j3 强市补充", "", f"数据待核验：{exc}"]
+    return out, opportunity
+
+
 def run(asof):
     start = (date.fromisoformat(asof) - timedelta(days=440)).isoformat()
     cal = read(bs.query_trade_dates(start_date=start, end_date=asof))
@@ -116,7 +174,7 @@ def run(asof):
         for attempt in range(2):
             try:
                 raw = read(bs.query_history_k_data_plus(code, FIELDS, start, asof, "d", "3"))
-                adj = read(bs.query_history_k_data_plus(code, "date,close", start, asof, "d", "2"))
+                adj = read(bs.query_history_k_data_plus(code, "date,close,high,low", start, asof, "d", "2"))
                 if raw.empty or adj.empty or raw.date.iloc[-1] != asof or adj.date.iloc[-1] != asof:
                     raise RuntimeError("当日日线未齐")
                 frames[code] = features(raw, adj)
@@ -167,7 +225,11 @@ def run(asof):
         "51 上游形态观察。下列标的为今日恰好四连板，供核对原低吸条件。四连板形态本身不足以确认 51 的买点。", ""])
     four = [f"- {code} {codes[code]}" for code, x in frames.items() if asof in x.index and x.at[asof, "four_board"]]
     report.extend(four or ["本次未见满足观察条件的四连板标的。"])
-    report.extend(["", "51 原低吸规则、32-A、33-A、39 和 55 的独立执行条件尚未接入，本次暂无可确认的机会主义买单计划。", ""])
+    report.extend(["", "51 原低吸规则、32-A、33-A、39 和 55 的独立执行条件尚未接入，其余机会主义路线本次暂无可确认的买单计划。", ""])
+    extra, opportunity = route_sections(frames, codes, asof, start)
+    section_two = report.index("## 二、机会主义信号")
+    report[section_two:section_two] = extra + [""]
+    report.extend(opportunity)
     if failed:
         report.extend(["### 缺失证券", "", ", ".join(code for code, _ in failed), ""])
     out = Path("reports")
