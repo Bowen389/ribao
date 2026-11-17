@@ -1,4 +1,8 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
+import socket
+from time import monotonic
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -113,6 +117,33 @@ def simulate(frames, sessions, mode, count, start_i, end_i):
     )
 
 
+def fetch_shard(shard, codes, start, asof):
+    socket.setdefaulttimeout(20)
+    started = monotonic()
+    login = bs.login()
+    if login.error_code != "0":
+        raise RuntimeError(f"分片 {shard} 登录失败: {login.error_msg}")
+    try:
+        frames, failed = {}, []
+        for position, code in enumerate(codes, 1):
+            for attempt in range(2):
+                try:
+                    raw = read(bs.query_history_k_data_plus(code, FIELDS, start, asof, "d", "3"))
+                    adj = read(bs.query_history_k_data_plus(code, "date,close,high,low", start, asof, "d", "2"))
+                    if raw.empty or adj.empty or raw.date.iloc[-1] != asof or adj.date.iloc[-1] != asof:
+                        raise RuntimeError("当日日线未齐")
+                    frames[code] = features(raw, adj)
+                    break
+                except (RuntimeError, ValueError, OSError) as exc:
+                    if attempt:
+                        failed.append((code, str(exc)))
+            if position % 25 == 0 or position == len(codes):
+                print(f'分片 {shard}: {position}/{len(codes)}，成功 {len(frames)}，失败 {len(failed)}，耗时 {monotonic()-started:.0f}s', flush=True)
+        return frames, failed
+    finally:
+        bs.logout()
+
+
 def run(asof):
     start = (date.fromisoformat(asof) - timedelta(days=440)).isoformat()
     cal = read(bs.query_trade_dates(start_date=start, end_date=asof))
@@ -128,18 +159,16 @@ def run(asof):
     if len(codes) < 2000:
         raise RuntimeError(f"主板日股票池仅 {len(codes)} 只，拒绝使用不完整快照")
     frames, failed = {}, []
-    for code in sorted(codes):
-        for attempt in range(2):
-            try:
-                raw = read(bs.query_history_k_data_plus(code, FIELDS, start, asof, "d", "3"))
-                adj = read(bs.query_history_k_data_plus(code, "date,close,high,low", start, asof, "d", "2"))
-                if raw.empty or adj.empty or raw.date.iloc[-1] != asof or adj.date.iloc[-1] != asof:
-                    raise RuntimeError("当日日线未齐")
-                frames[code] = features(raw, adj)
-                break
-            except (RuntimeError, ValueError, OSError) as exc:
-                if attempt:
-                    failed.append((code, str(exc)))
+    chunks = [sorted(codes)[offset::8] for offset in range(8)]
+    print(f"{asof} 主板股票池 {len(codes)} 只，启动 8 个独立行情连接", flush=True)
+    with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as pool:
+        futures = [pool.submit(fetch_shard, shard, chunk, start, asof) for shard, chunk in enumerate(chunks, 1)]
+        for future in as_completed(futures):
+            batch, errors = future.result()
+            frames.update(batch)
+            failed.extend(errors)
+    frames = dict(sorted(frames.items()))
+    print(f"行情读取完成：{len(frames)}/{len(codes)}，开始计算", flush=True)
     if len(frames) / len(codes) < .98:
         raise RuntimeError(f"{asof} 日线齐备 {len(frames)}/{len(codes)}，拒绝产出信号")
     first = max(len(sessions) - 252, 64)
@@ -195,6 +224,7 @@ def main():
     parser.add_argument("--date", default=datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat())
     args = parser.parse_args()
     date.fromisoformat(args.date)
+    socket.setdefaulttimeout(20)
     login = bs.login()
     if login.error_code != "0":
         raise RuntimeError(f"BaoStock 登录失败: {login.error_msg}")
