@@ -1,0 +1,32 @@
+name: 每周复盘与滚动训练
+on:
+  schedule:
+    - cron: '0 12 * * 6'
+  workflow_dispatch:
+  push:
+    paths: ['weekly_review.py']
+permissions:
+  contents: write
+concurrency:
+  group: ribao-weekly
+  cancel-in-progress: false
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas
+      - run: python -u weekly_review.py
+      - name: 保存复盘和模型
+        run: |
+          git add reviews/ models/
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Publish weekly review and rolling model'
+          git pull --rebase
+          git push
