@@ -1,11 +1,12 @@
 """Route-level nomination and settled-outcome portfolio allocation."""
 import numpy as np
 import pandas as pd
+import bf_combinations
 
 FAMILIES = {"01": "BF", "02": "BF", "03": "BF", "14": "BF",
             "08": "四象限", "09": "四象限", "13": "四象限",
             "15": "2j3", "16": "2j3"}
-CAPS = {"01": 1, "02": 1, "03": 1, "06": 1, "07": 1, "14": 2,
+CAPS = {"01": 1, "02": 2, "03": 2, "06": 1, "07": 1, "14": 2,
         "20": 2, "31": 1, "32-A": 1, "33-A": 1, "39": 1, "51": 1, "55": 1}
 RANK_GROUP = {"01": "BF", "02": "BF", "03": "BF"}
 
@@ -29,6 +30,12 @@ def nominate(frames, book, sessions, i, matching):
             continue
         for route, score in matching(routes, row).items():
             key = (-score, code)
+            reference = routes[route][3]
+            if isinstance(reference, dict):
+                option = bf_combinations.choose(reference["options"], row)
+                priority = {"BF": 0, "FB": 1, "CH": 2}[option["source"]]
+                key = (priority, -int(option["score"]) if priority == 1 else -option["score"],
+                       row.gap if priority == 1 else 0, code)
             if route == "06":
                 key = (row.gap, -prior.amount, code)
             elif route in {"07", "31", "32-A", "33-A", "11"}:
@@ -40,7 +47,19 @@ def nominate(frames, book, sessions, i, matching):
             buckets.setdefault(route, []).append((key, code))
     result = {}
     for route, items in buckets.items():
-        for rank, (_, code) in enumerate(sorted(items)[:CAPS.get(route, 2)]):
+        picked = []
+        sources = set()
+        for _, code in sorted(items):
+            reference = book[signal][code][route][3]
+            if isinstance(reference, dict):
+                option = bf_combinations.choose(reference["options"], frames[code].loc[day])
+                if option["source"] in sources:
+                    continue
+                sources.add(option["source"])
+            picked.append(code)
+            if len(picked) >= CAPS.get(route, 2):
+                break
+        for rank, code in enumerate(picked):
             result.setdefault(code, {})[route] = rank
     return result
 
@@ -84,7 +103,12 @@ def compare(frames, sessions, book, matching, opportunity):
             r = x.loc[sessions[i]]
             qty = max(0, int((10000 - 5) / (r.open * 1.001) / 100)) * 100
             for route in routes:
-                event = exit_event(x, sessions, i, route)
+                source_route = route
+                reference = book[sessions[i-1]][code][route][3]
+                if isinstance(reference, dict):
+                    option = bf_combinations.choose(reference["options"], r)
+                    source_route = "01" if option["source"] == "BF" else "FB"
+                event = exit_event(x, sessions, i, source_route)
                 exits[i, code, route] = event
                 if event is None or not qty:
                     continue
