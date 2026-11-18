@@ -56,8 +56,30 @@ def tags(x):
 
 
 def index_data(bs, read, code, start, end):
-    x = read(bs.query_history_k_data_plus(code, "date,close", start, end, "d", "3"))
-    return pd.to_numeric(x.set_index("date").close, errors="coerce")
+    from pathlib import Path
+    from time import sleep
+    target = Path(".ribao-cache") / end / f"index-{code}.csv"
+    if target.is_file():
+        x = pd.read_csv(target, dtype=str)
+        if not x.empty and x.date.iloc[-1] == end:
+            return pd.to_numeric(x.set_index("date").close, errors="coerce")
+    for attempt in range(3):
+        try:
+            bs.logout()
+            login = bs.login()
+            if login.error_code != "0":
+                raise RuntimeError(login.error_msg)
+            x = read(bs.query_history_k_data_plus(code, "date,close", start, end, "d", "3"))
+            if x.empty or x.date.iloc[-1] != end:
+                raise RuntimeError(f"{code} 指数未覆盖 {end}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            x.to_csv(target, index=False)
+            return pd.to_numeric(x.set_index("date").close, errors="coerce")
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"指数 {code} 第 {attempt + 1} 次读取失败：{exc}", flush=True)
+            if attempt == 2:
+                raise
+            sleep(2 ** attempt)
 
 
 def build_book(frames, sessions, sh, small):
