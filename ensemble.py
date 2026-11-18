@@ -1,6 +1,7 @@
 """Standalone reconstructions and shared-cash replay for the ribao signal universe."""
 import numpy as np
 import pandas as pd
+import bf_combinations
 
 RULES = {
     "01": ("BF 原版", -0.10, .0801),
@@ -52,7 +53,7 @@ def tags(x):
     x["strong"] = x.chg.ge(.04) & x.relative_amount.ge(1.5)
     x["breakout"] = x.adj.ge(x.adj.shift().rolling(60).max()) & x.relative_amount.ge(1.5)
     x["eligible"] = x.isST.eq("0") & x.close.ge(3) & x.liquid & (np.arange(len(x)) >= 60)
-    return x
+    return bf_combinations.add_features(x)
 
 
 def index_data(bs, read, code, start, end):
@@ -82,7 +83,7 @@ def index_data(bs, read, code, start, end):
             sleep(2 ** attempt)
 
 
-def build_book(frames, sessions, sh, small):
+def build_book(frames, sessions, sh, small, combinations=None):
     book = {}
     advances = pd.DataFrame({c: x.chg for c, x in frames.items()}).reindex(sessions)
     width = advances.gt(0).sum(axis=1) / advances.count(axis=1)
@@ -125,9 +126,7 @@ def build_book(frames, sessions, sh, small):
                 points = int(r.prior_limit_count == 1) + int(r.amount20 >= 2.5e8) + int(r.gap >= 0)
                 if points >= 2:
                     add(c, "14", points * 1e10 + r.amount20)
-                    if r.prior_red and not r.prior_touch and r.amount20 >= 2e8:
-                        for rid in ("01", "02", "03"):
-                            add(c, rid, points * 1e10 + r.amount20)
+
             if r.first_clean and below and r.below_median:
                 add(c, "31", r.amount)
             if r.two_board and below:
@@ -156,6 +155,10 @@ def build_book(frames, sessions, sh, small):
                         if rid == "13" and quadrant == 4:
                             lo = -.065
                         add(c, rid, np.log1p(r.amount / median), (lo, hi))
+        if combinations is not None:
+            for c, options in combinations.get(day, {}).items():
+                for rid in ("01", "02", "03"):
+                    selected.setdefault(c, {})[rid] = (0., -.10, .081, {"options": options})
         ranked = []
         lookup = dict(current)
         for c in set(selected) | {c for c, r in current if r.breakout and r.eligible}:
@@ -177,6 +180,11 @@ def build_book(frames, sessions, sh, small):
 def matching(routes, row):
     matched = {}
     for k, (score, lo, hi, ref) in routes.items():
+        if isinstance(ref, dict):
+            option = bf_combinations.choose(ref["options"], row)
+            if option:
+                matched[k] = option["score"]
+            continue
         if k == "20":
             gap_ok = -.02 <= row.gap < -.01 or 0 <= row.gap < .03
         else:
@@ -305,7 +313,11 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
     small = index_data(bs, read, "sh.000852", start, asof)
     if asof not in sh.index or asof not in small.index or not np.isfinite(sh.at[asof]) or not np.isfinite(small.at[asof]):
         raise RuntimeError("当日上证或中证1000指数缺失")
-    book = build_book(frames, sessions, sh, small)
+    csi300 = index_data(bs, read, "sh.000300", start, asof)
+    if asof not in csi300.index or not np.isfinite(csi300.at[asof]):
+        raise RuntimeError("沪深300当日日线缺失")
+    combinations, bf_audits = bf_combinations.build(frames, sessions, small, csi300)
+    book = build_book(frames, sessions, sh, small, combinations)
     import allocation
     legacy_rows, _, _, _ = legacy_compare(frames, sessions, book)
     rows, choice, begin, cut, standalone = allocation.compare(frames, sessions, book, matching, OPPORTUNITY)
@@ -329,21 +341,7 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
     out.extend(["", "当前后段已被研究查看，结果属于回放验证。原始路线尚有重建条件；BF组合补位、四象限原评分等差异仍待还原。", "逐笔与单路线结果同时保存为当天 CSV。"])
     opportunity = ["", "盘后预选须等次日真实开盘确认。默认每笔最多 1 万、整手，买入后下一交易日收盘退出；16 按封板状态决定下一交易日开盘或收盘卖。", ""]
     latest = book.get(asof, {})
-    bf_rows = [x.loc[asof] for x in frames.values() if asof in x.index]
-    stages = [
-        ("基础股票池", lambda r: r.eligible),
-        ("当日收盘封板", lambda r: r.eligible and r.up),
-        ("反包结构", lambda r: r.eligible and r.up and r.body_break and r.prior_limit_count >= 1 and (r.prior_red or r.prior_touch)),
-        ("昨日收阴且未触板未封、20日均额至少2亿", lambda r: r.eligible and r.up and r.body_break and r.prior_limit_count >= 1 and r.prior_red and not r.prior_touch and r.amount20 >= 2e8),
-    ]
-    ma20 = sh.rolling(20).mean().at[asof]
-    gate_open = bool(sh.at[asof] >= ma20)
-    out.extend(["", "### BF 路线核验", "",
-                f"当前重建版指数代理为上证：收盘 {sh.at[asof]:.2f}，MA20 {ma20:.2f}，门控{'通过' if gate_open else '关闭'}。原研究采用主板等权指数，代理会改变信号。",
-                "|逐层条件|数量|", "|---|---:|"])
-    out.extend(f"|{name}|{sum(bool(test(r)) for r in bf_rows)}|" for name, test in stages)
-    out.extend(["", "01、02、03 当前共用 BF 核心候选。原三路组合中的首板和冠军补位尚未完整接入，下面的零候选仅代表 BF 核心最终名单。"])
-
+    out.extend(bf_combinations.report(frames, codes, sessions, combinations, bf_audits, asof))
     from pathlib import Path
     import json
     active = Path("models/active.json")
@@ -357,6 +355,8 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
     else:
         out.extend(["", "每周训练尚无通过验证的活动模型，暂按各路线原条件展示。"])
     for k, (name, _, _) in RULES.items():
+        if k in {"01", "02", "03"}:
+            continue
         target = opportunity if k in OPPORTUNITY else out
         label = "（BF核心，组合补位待还原）" if k in {"01", "02", "03"} else ("（重建验证版）" if k in REBUILT else "")
         found = [(c, v[k]) for c, v in latest.items() if k in v]
