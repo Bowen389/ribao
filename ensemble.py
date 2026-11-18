@@ -186,7 +186,7 @@ def matching(routes, row):
     return matched
 
 
-def compare(frames, sessions, book):
+def legacy_compare(frames, sessions, book):
     start = max(1, len(sessions) - 252)
     cut = (start + len(sessions)) // 2
 
@@ -306,10 +306,12 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
     if asof not in sh.index or asof not in small.index or not np.isfinite(sh.at[asof]) or not np.isfinite(small.at[asof]):
         raise RuntimeError("当日上证或中证1000指数缺失")
     book = build_book(frames, sessions, sh, small)
-    rows, choice, begin, cut = compare(frames, sessions, book)
+    import allocation
+    legacy_rows, _, _, _ = legacy_compare(frames, sessions, book)
+    rows, choice, begin, cut, standalone = allocation.compare(frames, sessions, book, matching, OPPORTUNITY)
     out = ["", "### 跨策略共用资金对照", "",
            f"观察期自 {begin} 起，{cut} 起为独立留出段。每段 6 万起步、每笔最多 1 万、最多 6 仓。按路线处理卖点：07 多持一天，06/BF 封板续持，15/16 封板后次日开盘退出。其余按下一交易日收盘代理。",
-           "滚动分为过去60个交易日可得的事件净收益之和除以（样本数＋20），缺样本记0。第二笔增益按同方案两笔减一笔计算。","同股只成交一次，BF 变体和四象限变体分别合并计一个家族。开发段以回撤≤15%、开仓≥15、夏普为正筛选，再按夏普排序。",
+           "路线先按各自排序和名额提名。滚动分使用相同卖点、费用和延期退出引擎已平仓的提名交易，近60日净收益之和除以（样本数＋20）。门控方案要求至少10笔且分数>0，允许空仓。第二笔增益按同方案两笔减一笔计算。","同股只成交一次，BF 变体和四象限变体分别合并计一个家族。开发段以回撤≤15%、开仓≥15、夏普为正筛选，再按夏普排序。",
            "回测股票来自报告日可取股票池，存在幸存者偏差；重建规则的原历史夏普不能直接沿用。", "",
            "|方法|每日上限|开发 年化／回撤／夏普／笔数／净利|留出 年化／回撤／夏普／笔数／净利|",
            "|---|---:|---|---|"]
@@ -320,6 +322,11 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
         out.append(f"- {one[0]}：¥{two[3][4] - one[3][4]:+,.0f}")
     out.extend(["", (f"开发段首选：{choice[0]}，每日最多 {choice[1]} 笔。留出段结果见表。"
                      if choice else "暂无通过开发门槛的综合方案。"), ""])
+    out.extend(["", "### 单路线核对", "", "|路线|开发 年化／回撤／夏普／笔数／净利|后段 年化／回撤／夏普／笔数／净利|", "|---|---|---|"])
+    out.extend(f"|{route}|{metric(a)}|{metric(b)}|" for route,a,b in standalone)
+    out.extend(["", "### 旧调度基线（供核对修改影响）", "", "|方法|上限|开发|后段|", "|---|---:|---|---|"])
+    out.extend(f"|{r}|{n}|{metric(a)}|{metric(b)}|" for r,n,a,b in legacy_rows)
+    out.extend(["", "当前后段已被研究查看，结果属于回放验证。原始路线尚有重建条件；BF组合补位、四象限原评分等差异仍待还原。", "逐笔与单路线结果同时保存为当天 CSV。"])
     opportunity = ["", "盘后预选须等次日真实开盘确认。默认每笔最多 1 万、整手，买入后下一交易日收盘退出；16 按封板状态决定下一交易日开盘或收盘卖。", ""]
     latest = book.get(asof, {})
     for k, (name, _, _) in RULES.items():
