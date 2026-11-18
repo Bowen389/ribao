@@ -329,6 +329,21 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
     out.extend(["", "当前后段已被研究查看，结果属于回放验证。原始路线尚有重建条件；BF组合补位、四象限原评分等差异仍待还原。", "逐笔与单路线结果同时保存为当天 CSV。"])
     opportunity = ["", "盘后预选须等次日真实开盘确认。默认每笔最多 1 万、整手，买入后下一交易日收盘退出；16 按封板状态决定下一交易日开盘或收盘卖。", ""]
     latest = book.get(asof, {})
+    bf_rows = [x.loc[asof] for x in frames.values() if asof in x.index]
+    stages = [
+        ("基础股票池", lambda r: r.eligible),
+        ("当日收盘封板", lambda r: r.eligible and r.up),
+        ("反包结构", lambda r: r.eligible and r.up and r.body_break and r.prior_limit_count >= 1 and (r.prior_red or r.prior_touch)),
+        ("昨日收阴且未触板未封、20日均额至少2亿", lambda r: r.eligible and r.up and r.body_break and r.prior_limit_count >= 1 and r.prior_red and not r.prior_touch and r.amount20 >= 2e8),
+    ]
+    ma20 = sh.rolling(20).mean().at[asof]
+    gate_open = bool(sh.at[asof] >= ma20)
+    out.extend(["", "### BF 路线核验", "",
+                f"当前重建版指数代理为上证：收盘 {sh.at[asof]:.2f}，MA20 {ma20:.2f}，门控{'通过' if gate_open else '关闭'}。原研究采用主板等权指数，代理会改变信号。",
+                "|逐层条件|数量|", "|---|---:|"])
+    out.extend(f"|{name}|{sum(bool(test(r)) for r in bf_rows)}|" for name, test in stages)
+    out.extend(["", "01、02、03 当前共用 BF 核心候选。原三路组合中的首板和冠军补位尚未完整接入，下面的零候选仅代表 BF 核心最终名单。"])
+
     from pathlib import Path
     import json
     active = Path("models/active.json")
@@ -343,7 +358,7 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
         out.extend(["", "每周训练尚无通过验证的活动模型，暂按各路线原条件展示。"])
     for k, (name, _, _) in RULES.items():
         target = opportunity if k in OPPORTUNITY else out
-        label = "（重建验证版）" if k in REBUILT else ""
+        label = "（BF核心，组合补位待还原）" if k in {"01", "02", "03"} else ("（重建验证版）" if k in REBUILT else "")
         found = [(c, v[k]) for c, v in latest.items() if k in v]
         target.extend([f"#### {k} {name}{label}", ""])
         for c, (_, lo, hi, ref) in sorted(found, key=lambda t: (-t[1][0], t[0])):
@@ -351,6 +366,6 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
             more = f"，并距今日 MA5 参考价 {ref:.2f} 不超过 2%" if ref else ""
             target.append(f"- {c} {codes[c]}：次日开盘缺口 {band}{more}。")
         if not found:
-            target.append("零盘后候选。")
+            target.append("BF 核心零候选；组合完整候选状态待还原补位后确认。" if k in {"01", "02", "03"} else "零盘后候选。")
         target.append("")
     return out, opportunity
