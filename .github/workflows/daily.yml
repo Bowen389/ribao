@@ -1,8 +1,5 @@
 name: 18点独立盘后日报
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/daily.yml']
   schedule:
     - cron: '0 10 * * 1-5'
   workflow_dispatch:
@@ -32,7 +29,7 @@ jobs:
           restore-keys: ribao-v1-
       - name: 独立取数与扫描
         env:
-          REQUEST_DATE: ${{ inputs.date || '2026-11-17' }}
+          REQUEST_DATE: ${{ inputs.date }}
         run: |
           if [ -n "$REQUEST_DATE" ]; then
             python -u daily.py --date "$REQUEST_DATE"
