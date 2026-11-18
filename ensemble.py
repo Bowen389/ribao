@@ -329,6 +329,18 @@ def markdown(frames, codes, sessions, asof, start, bs, read):
     out.extend(["", "当前后段已被研究查看，结果属于回放验证。原始路线尚有重建条件；BF组合补位、四象限原评分等差异仍待还原。", "逐笔与单路线结果同时保存为当天 CSV。"])
     opportunity = ["", "盘后预选须等次日真实开盘确认。默认每笔最多 1 万、整手，买入后下一交易日收盘退出；16 按封板状态决定下一交易日开盘或收盘卖。", ""]
     latest = book.get(asof, {})
+    from pathlib import Path
+    import json
+    active = Path("models/active.json")
+    if active.exists():
+        model = json.loads(active.read_text(encoding="utf-8"))
+        out.extend(["", "### 每周学习排序", "", f"活动模型训练日 {model['trained_at']}。次日先满足各路线开盘条件，再按下列路线分数竞争最多两个名额，同股只买一次。"])
+        for route, score in sorted(model["scores"].items(), key=lambda item: -item[1]):
+            candidates = [c for c, routes in latest.items() if route in routes]
+            out.append(f"- {route} {RULES.get(route, (route,))[0]}：分数 {score:.4f}；盘后候选 {len(candidates)} 只。")
+        out.append("盘后名单仅供次日开盘确认，实际成交还需现金、持仓和整手约束。")
+    else:
+        out.extend(["", "每周训练尚无通过验证的活动模型，暂按各路线原条件展示。"])
     for k, (name, _, _) in RULES.items():
         target = opportunity if k in OPPORTUNITY else out
         label = "（重建验证版）" if k in REBUILT else ""
