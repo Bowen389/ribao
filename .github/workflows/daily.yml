@@ -1,6 +1,11 @@
 name: 18点独立盘后日报
 on:
+  push:
+    branches: [main]
+    paths: [daily.py, .github/workflows/daily.yml]
   schedule:
+    # GitHub native schedule; UTC -> Asia/Shanghai 17:00 / 18:00
+    - cron: '0 9 * * 1-5'
     - cron: '0 10 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -21,12 +26,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install baostock pandas numpy
+      - run: pip install baostock pandas numpy 'exchange-calendars>=4.11,<5'
       - uses: actions/cache/restore@v4
         with:
           path: .ribao-cache
           key: ribao-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ribao-v1-
+      - run: python -m unittest test_recovery -v
       - name: 独立取数与扫描
         env:
           REQUEST_DATE: ${{ inputs.date }}
@@ -42,6 +48,7 @@ jobs:
           path: .ribao-cache
           key: ribao-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: 发布日报
+        if: always()
         run: |
           if [ ! -d reports ]; then exit 0; fi
           git add reports/
