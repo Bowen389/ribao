@@ -128,6 +128,9 @@ def fetch_shard(shard, codes, start, asof):
     try:
         frames, failed = {}, []
         for position, code in enumerate(codes, 1):
+            if monotonic() - started >= 3000:
+                failed.extend((c, '取数检查点：保留缓存，下一次补跑继续') for c in codes[position-1:])
+                break
             target = cache / f"{code}.json.gz"
             for attempt in range(3):
                 try:
@@ -208,9 +211,10 @@ def run(asof):
     if len(codes) < 2000:
         raise RuntimeError(f"主板日股票池仅 {len(codes)} 只，拒绝使用不完整快照")
     frames, failed = {}, []
-    chunks = [sorted(codes)[offset::2] for offset in range(2)]
-    print(f"{asof} 主板股票池 {len(codes)} 只，启动 2 个独立行情连接", flush=True)
-    with ProcessPoolExecutor(max_workers=2, mp_context=get_context("spawn")) as pool:
+    workers = 8
+    chunks = [sorted(codes)[offset::workers] for offset in range(workers)]
+    print(f"{asof} 主板股票池 {len(codes)} 只，启动 {workers} 个独立行情连接；50分钟保存检查点", flush=True)
+    with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as pool:
         futures = [pool.submit(fetch_shard, shard, chunk, start, asof) for shard, chunk in enumerate(chunks, 1)]
         for future in as_completed(futures):
             try:
