@@ -174,6 +174,26 @@ def fetch_shard(shard, codes, start, asof):
             bs.logout()
 
 
+def load_universe(asof):
+    universe = pd.DataFrame()
+    for attempt in range(3):
+        universe = read(bs.query_all_stock(asof))
+        if not universe.empty:
+            universe = universe[universe.code.str.startswith(MAIN) & (universe.tradeStatus.astype(str) == '1')]
+        if len(universe) >= 2000:
+            break
+        sleep(2 ** attempt)
+    if len(universe) < 2000:
+        # Basic security records supply identity/listing dates only. Trading/ST
+        # eligibility still comes from each exact-date historical bar below.
+        basic = read(bs.query_stock_basic())
+        if not basic.empty:
+            active = basic.code.str.startswith(MAIN) & basic.ipoDate.le(asof)
+            active &= basic.outDate.eq('') | basic.outDate.gt(asof)
+            universe = basic.loc[active, ['code', 'code_name']]
+    return universe
+
+
 def run(asof):
     start = (date.fromisoformat(asof) - timedelta(days=440)).isoformat()
     cal = read(bs.query_trade_dates(start_date=start, end_date=asof))
@@ -183,8 +203,7 @@ def run(asof):
     if asof not in sessions:
         print(f"{asof} 休市")
         return
-    universe = read(bs.query_all_stock(asof))
-    universe = universe[universe.code.str.startswith(MAIN) & (universe.tradeStatus == "1")]
+    universe = load_universe(asof)
     codes = dict(zip(universe.code, universe.code_name))
     if len(codes) < 2000:
         raise RuntimeError(f"主板日股票池仅 {len(codes)} 只，拒绝使用不完整快照")
@@ -255,8 +274,14 @@ def run(asof):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", default=datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat())
+    parser.add_argument("--date")
     args = parser.parse_args()
+    from exchange_calendars import get_calendar
+    now = datetime.now(ZoneInfo('Asia/Shanghai'))
+    cutoff = now.date() - timedelta(days=int(now.hour < 15))
+    args.date = args.date or str(get_calendar('XSHG').date_to_session(str(cutoff), direction='previous').date())
+    if args.date > str(cutoff):
+        parser.error('请选择已收盘日期')
     date.fromisoformat(args.date)
     socket.setdefaulttimeout(20)
     login = bs.login()
@@ -264,6 +289,12 @@ def main():
         raise RuntimeError(f"BaoStock 登录失败: {login.error_msg}")
     try:
         run(args.date)
+    except Exception as exc:
+        out = Path('reports')
+        out.mkdir(exist_ok=True)
+        (out / f'{args.date}-data-quality.json').write_text(json.dumps({'date':args.date,'status':'failed','error':str(exc)},ensure_ascii=False,indent=2),encoding='utf-8')
+        (out / f'{args.date}-data-quality.md').write_text(f'# {args.date} 日报未完成\n\n{exc}\n\n未将旧日报冒充当日结果。\n',encoding='utf-8')
+        raise
     finally:
         bs.logout()
 
