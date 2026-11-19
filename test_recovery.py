@@ -7,6 +7,17 @@ import pandas as pd
 import daily
 
 class Recovery(unittest.TestCase):
+    def test_worker_checkpoint_returns_unprocessed_codes_for_recovery(self):
+        from contextlib import chdir
+        import tempfile
+        with tempfile.TemporaryDirectory() as root,chdir(root), \
+             patch.object(daily,'monotonic',side_effect=[0,3001]), \
+             patch.object(daily.bs,'query_history_k_data_plus') as query:
+            frames,failed=daily.fetch_shard(1,['sh.600001','sz.000001'],'2025-01-01','2026-11-19')
+            self.assertFalse(frames)
+            self.assertEqual([code for code,_ in failed],['sh.600001','sz.000001'])
+            query.assert_not_called()
+
     def test_premarket_defaults_to_last_closed_session(self):
         clock=datetime(2026,11,19,12,0,tzinfo=ZoneInfo('Asia/Shanghai'))
         with patch('sys.argv',['daily.py']),patch.object(daily,'datetime') as time, \
